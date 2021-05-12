@@ -9,16 +9,27 @@
 
 #include <stdint.h>
 
-typedef struct {
+#ifdef _MSC_VER
+#define ALIGN_AVX2_MSC __declspec(align(32))
+#define ALIGN_AVX2_GCC
+#else
+#define ALIGN_AVX2_MSC
+#define ALIGN_AVX2_GCC __attribute((alignment(32)))
+#endif
+
+#define ALIGN_AVX2_1 ALIGN_AVX2_MSC
+#define ALIGN_AVX2_2 ALIGN_AVX2_GCC
+
+ALIGN_AVX2_1 typedef struct {
     /* X = sum(i=0..9, n[i]*2^(i*26)) mod p
      * where p = 2^256 - 0x1000003D1
      */
-    uint32_t n[10];
+    ALIGN_AVX2_1 uint32_t n[10] ALIGN_AVX2_2;
 #ifdef VERIFY
     int magnitude;
     int normalized;
 #endif
-} secp256k1_fe;
+} secp256k1_fe ALIGN_AVX2_2;
 
 /* Unpacks a constant into a overlapping multi-limbed FE element. */
 #define SECP256K1_FE_CONST_INNER(d7, d6, d5, d4, d3, d2, d1, d0) { \

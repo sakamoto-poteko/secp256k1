@@ -11,6 +11,10 @@
 #include "field.h"
 #include "modinv32_impl.h"
 
+//#ifdef INTC_INTRIN
+#include <immintrin.h>
+#include <xmmintrin.h>
+
 #ifdef VERIFY
 static void secp256k1_fe_verify(const secp256k1_fe *a) {
     const uint32_t *d = a->n;
@@ -461,7 +465,19 @@ void secp256k1_fe_sqr_inner(uint32_t *r, const uint32_t *a);
 #define VERIFY_BITS(x, n) do { } while(0)
 #endif
 
+// AVX2
+SECP256K1_INLINE static __m256i reverse_m256i(const __m256i val)
+{
+    __m256i result = _mm256_shuffle_epi32(val, _MM_SHUFFLE(0, 1, 2, 3));
+    result = _mm256_permute2f128_si256(result, result, 1);
+    return result;
+}
+
 SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t *a, const uint32_t * SECP256K1_RESTRICT b) {
+    __assume_aligned(a, 32);
+    __assume_aligned(r, 32);
+    __assume_aligned(b, 32);
+	
     uint64_t c, d;
     uint64_t u0, u1, u2, u3, u4, u5, u6, u7, u8;
     uint32_t t9, t1, t0, t2, t3, t4, t5, t6, t7;
@@ -494,6 +510,21 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
      *  Note that [x 0 0 0 0 0 0 0 0 0 0] = [x*R1 x*R0].
      */
 
+    __m256i a0_3 =  _mm256_cvtepu32_epi64(*(__m128i*)a);
+    __m256i a4_7 = _mm256_cvtepu32_epi64(*(__m128i*)(a + 4));
+    __m256i a8_9 = _mm256_cvtepu32_epi64(*(__m128i*)(a + 8)); // we're 32B aligned so it's not overflowing anyway
+
+    __m256i b0_2 = _mm256_cvtepu32_epi64(*(__m128i*)b);
+    __m256i b2_5 = _mm256_cvtepu32_epi64(*(__m128i*)(b + 2));
+    __m256i b6_9 = _mm256_cvtepu32_epi64(*(__m128i*)(b + 6));
+
+
+    __m256i b9_6 = reverse_m256i(b6_9);
+    __m256i b5_2 = reverse_m256i(b2_5);
+    __m256i b2_0 = reverse_m256i(b0_2);
+	
+    __m256i m1, m2, m3, m4;
+	
     d  = (uint64_t)a[0] * b[9]
        + (uint64_t)a[1] * b[8]
        + (uint64_t)a[2] * b[7]
@@ -504,6 +535,11 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
        + (uint64_t)a[7] * b[2]
        + (uint64_t)a[8] * b[1]
        + (uint64_t)a[9] * b[0];
+
+    m1 = _mm256_mul_epu32(a0_3, b9_6);
+    m1 = _mm256_mul_epu32(a0_3, b9_6);
+
+	
     /* VERIFY_BITS(d, 64); */
     /* [d 0 0 0 0 0 0 0 0 0] = [p9 0 0 0 0 0 0 0 0 0] */
     t9 = d & M; d >>= 26;

@@ -278,7 +278,16 @@ SECP256K1_GNUC_EXT typedef __int128 int128_t;
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0
+#elif defined(__INTEL_COMPILER) && defined(_MSC_VER)
+// ICC in Windows. There's no __builtin_ctz but there's Intel intrinsics
+#include <intrin.h>
+static inline int __builtin_ctz(unsigned x) {
+    unsigned long ret;
+    _BitScanForward(&ret, x);
+    return (int)ret;
+}
 #endif
+
 
 /* Determine the number of trailing zero bits in a (non-zero) 32-bit x.
  * This function is only intended to be used as fallback for
