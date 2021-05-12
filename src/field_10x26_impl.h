@@ -11,9 +11,31 @@
 #include "field.h"
 #include "modinv32_impl.h"
 
-//#ifdef INTC_INTRIN
+#define INTC_HASWELL
+
+#ifdef INTC_HASWELL
+#include <stdint.h>
 #include <immintrin.h>
 #include <xmmintrin.h>
+
+
+ // AVX2
+inline static __m256i reverse_m256i_epi64(const __m256i val)
+{
+    __m256i result = _mm256_permute4x64_epi64(val, _MM_SHUFFLE(0, 1, 2, 3));
+    return result;
+}
+
+inline uint64_t hsum_uint64_avx(__m256i v) {
+    __m128i vlow = _mm256_castsi256_si128(v);
+    __m128i vhigh = _mm256_extracti128_si256(v, 1); // high 128
+    vlow = _mm_add_epi64(vlow, vhigh);     // reduce down to 128
+
+    __m128i high64 = _mm_unpackhi_epi64(vlow, vlow);
+    return _mm_cvtsi128_si64(_mm_add_epi64(vlow, high64));  // reduce to scalar
+}
+
+#endif
 
 #ifdef VERIFY
 static void secp256k1_fe_verify(const secp256k1_fe *a) {
@@ -483,6 +505,36 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     uint32_t t9, t1, t0, t2, t3, t4, t5, t6, t7;
     const uint32_t M = 0x3FFFFFFUL, R0 = 0x3D10UL, R1 = 0x400UL;
 
+    const uint64_t YYYN_MASK[4] = { 0xFFFFFFFFFFFFFFFFlu, 0xFFFFFFFFFFFFFFFFlu, 0xFFFFFFFFFFFFFFFFlu, 0 };
+    const uint64_t YYNN_MASK[4] = { 0xFFFFFFFFFFFFFFFFlu, 0xFFFFFFFFFFFFFFFFlu, 0, 0 };
+    const uint64_t YNNN_MASK[4] = { 0xFFFFFFFFFFFFFFFFlu, 0, 0, 0 };
+    const uint64_t NNYY_MASK[4] = { 0, 0,0xFFFFFFFFFFFFFFFFlu, 0xFFFFFFFFFFFFFFFFlu };
+    const __m256i yyyn = *(__m256i*)YYYN_MASK;
+    const __m256i yynn = *(__m256i*)YYNN_MASK;
+    const __m256i nnyy = *(__m256i*)NNYY_MASK;
+
+
+    const __m256i a0123 = _mm256_cvtepu32_epi64(*(__m128i*)a);
+    const __m256i a4567 = _mm256_cvtepu32_epi64(*(__m128i*)(a + 4));
+    const __m256i a89uu = _mm256_cvtepu32_epi64(*(__m128i*)(a + 8)); // we're 32B aligned so it's not overflowing anyway
+    const __m256i a8989 = _mm256_permute4x64_epi64(a89uu, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256i a89zz = _mm256_and_si256(a8989, yynn);
+
+    const __m256i b0123 = _mm256_cvtepu32_epi64(*(__m128i*)(b));
+    //const __m256i b0101 = _mm256_permute4x64_epi64(b0123, _MM_SHUFFLE(1, 0, 1, 0));
+    const __m256i b2345 = _mm256_cvtepu32_epi64(*(__m128i*)(b + 2));
+    const __m256i b6789 = _mm256_cvtepu32_epi64(*(__m128i*)(b + 6));
+
+    const __m256i b9876 = reverse_m256i_epi64(b6789);
+    const __m256i b5432 = reverse_m256i_epi64(b2345);
+    const __m256i b1010 = _mm256_permute4x64_epi64(b0123, _MM_SHUFFLE(0, 0, 0, 1));
+    //const __m256i b1010 = reverse_m256i_epi64(b0101);
+    const __m256i b10zz = _mm256_and_si256(b1010, yynn);
+
+    __m256i ymm0, ymm1, ymm2, ymm3;
+    __m128i xmm0, xmm1, xmm2;
+
+
     VERIFY_BITS(a[0], 30);
     VERIFY_BITS(a[1], 30);
     VERIFY_BITS(a[2], 30);
@@ -510,21 +562,7 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
      *  Note that [x 0 0 0 0 0 0 0 0 0 0] = [x*R1 x*R0].
      */
 
-    __m256i a0_3 =  _mm256_cvtepu32_epi64(*(__m128i*)a);
-    __m256i a4_7 = _mm256_cvtepu32_epi64(*(__m128i*)(a + 4));
-    __m256i a8_9 = _mm256_cvtepu32_epi64(*(__m128i*)(a + 8)); // we're 32B aligned so it's not overflowing anyway
-
-    __m256i b0_2 = _mm256_cvtepu32_epi64(*(__m128i*)b);
-    __m256i b2_5 = _mm256_cvtepu32_epi64(*(__m128i*)(b + 2));
-    __m256i b6_9 = _mm256_cvtepu32_epi64(*(__m128i*)(b + 6));
-
-
-    __m256i b9_6 = reverse_m256i(b6_9);
-    __m256i b5_2 = reverse_m256i(b2_5);
-    __m256i b2_0 = reverse_m256i(b0_2);
-	
-    __m256i m1, m2, m3, m4;
-	
+#ifndef INTC_HASWELL
     d  = (uint64_t)a[0] * b[9]
        + (uint64_t)a[1] * b[8]
        + (uint64_t)a[2] * b[7]
@@ -535,10 +573,13 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
        + (uint64_t)a[7] * b[2]
        + (uint64_t)a[8] * b[1]
        + (uint64_t)a[9] * b[0];
-
-    m1 = _mm256_mul_epu32(a0_3, b9_6);
-    m1 = _mm256_mul_epu32(a0_3, b9_6);
-
+#else
+    ymm0 = _mm256_mul_epu32(a0123, b9876);
+    ymm1 = _mm256_mul_epu32(a4567, b5432);
+    ymm2 = _mm256_mul_epu32(a89zz, b10zz);
+    ymm3 = _mm256_add_epi64(_mm256_add_epi64(ymm0, ymm1), ymm2);
+    d = hsum_uint64_avx(ymm3);
+#endif
 	
     /* VERIFY_BITS(d, 64); */
     /* [d 0 0 0 0 0 0 0 0 0] = [p9 0 0 0 0 0 0 0 0 0] */
@@ -550,6 +591,7 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     c  = (uint64_t)a[0] * b[0];
     VERIFY_BITS(c, 60);
     /* [d t9 0 0 0 0 0 0 0 0 c] = [p9 0 0 0 0 0 0 0 0 p0] */
+#ifndef INTC_HASWELL
     d += (uint64_t)a[1] * b[9]
        + (uint64_t)a[2] * b[8]
        + (uint64_t)a[3] * b[7]
@@ -559,6 +601,15 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
        + (uint64_t)a[7] * b[3]
        + (uint64_t)a[8] * b[2]
        + (uint64_t)a[9] * b[1];
+#else
+    const __m256i a1234 = _mm256_cvtepu32_epi64(*(__m128i*)(a + 1));
+    const __m256i a5678 = _mm256_cvtepu32_epi64(*(__m128i*)(a + 5));
+    ymm0 = _mm256_mul_epu32(a1234, b9876);
+    ymm1 = _mm256_mul_epu32(a5678, b5432);
+    ymm2 = _mm256_add_epi64(ymm0, ymm1);
+    d += hsum_uint64_avx(ymm2) + (uint64_t)a[9] * b[1];
+#endif
+
     VERIFY_BITS(d, 63);
     /* [d t9 0 0 0 0 0 0 0 0 c] = [p10 p9 0 0 0 0 0 0 0 0 p0] */
     u0 = d & M; d >>= 26; c += u0 * R0;
@@ -572,10 +623,19 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     /* [d u0 t9 0 0 0 0 0 0 0 c-u0*R1 t0-u0*R0] = [p10 p9 0 0 0 0 0 0 0 0 p0] */
     /* [d 0 t9 0 0 0 0 0 0 0 c t0] = [p10 p9 0 0 0 0 0 0 0 0 p0] */
 
+#ifndef INTC_HASWELL
     c += (uint64_t)a[0] * b[1]
        + (uint64_t)a[1] * b[0];
+#else
+    ymm0 = _mm256_mul_epu32(a0123, b10zz);
+    xmm0 = _mm256_castsi256_si128(ymm0);
+    xmm1 = _mm_unpackhi_epi64(xmm0, xmm0);
+    c += _mm_cvtsi128_si64(_mm_add_epi64(xmm0, xmm1));
+#endif
+
     VERIFY_BITS(c, 62);
     /* [d 0 t9 0 0 0 0 0 0 0 c t0] = [p10 p9 0 0 0 0 0 0 0 p1 p0] */
+#ifndef INTC_HASWELL
     d += (uint64_t)a[2] * b[9]
        + (uint64_t)a[3] * b[8]
        + (uint64_t)a[4] * b[7]
@@ -584,6 +644,15 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
        + (uint64_t)a[7] * b[4]
        + (uint64_t)a[8] * b[3]
        + (uint64_t)a[9] * b[2];
+#else
+    const __m256i a2345 = _mm256_permute2x128_si256(a0123, a4567, 0b0010'0001);
+    const __m256i a6789 = _mm256_permute2x128_si256(a4567, a8989, 0b0010'0001);
+    ymm0 = _mm256_mul_epu32(a2345, b9876);
+    ymm1 = _mm256_mul_epu32(a6789, b5432);
+    ymm2 = _mm256_add_epi64(ymm0, ymm1);
+    d += hsum_uint64_avx(ymm2);
+#endif
+
     VERIFY_BITS(d, 63);
     /* [d 0 t9 0 0 0 0 0 0 0 c t0] = [p11 p10 p9 0 0 0 0 0 0 0 p1 p0] */
     u1 = d & M; d >>= 26; c += u1 * R0;
@@ -597,11 +666,18 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     /* [d u1 0 t9 0 0 0 0 0 0 c-u1*R1 t1-u1*R0 t0] = [p11 p10 p9 0 0 0 0 0 0 0 p1 p0] */
     /* [d 0 0 t9 0 0 0 0 0 0 c t1 t0] = [p11 p10 p9 0 0 0 0 0 0 0 p1 p0] */
 
+#ifndef INTC_HASWELL
     c += (uint64_t)a[0] * b[2]
        + (uint64_t)a[1] * b[1]
        + (uint64_t)a[2] * b[0];
+#else
+    const __m256i b2100 = _mm256_permute4x64_epi64(b0123, _MM_SHUFFLE(0, 0, 1, 2));
+    const __m256i b210z = _mm256_and_si256(b2100, yyyn);
+    c += hsum_uint64_avx(_mm256_mul_epu32(a0123, b210z));
+#endif
     VERIFY_BITS(c, 62);
     /* [d 0 0 t9 0 0 0 0 0 0 c t1 t0] = [p11 p10 p9 0 0 0 0 0 0 p2 p1 p0] */
+#ifndef INTC_HASWELL
     d += (uint64_t)a[3] * b[9]
        + (uint64_t)a[4] * b[8]
        + (uint64_t)a[5] * b[7]
@@ -609,6 +685,17 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
        + (uint64_t)a[7] * b[5]
        + (uint64_t)a[8] * b[4]
        + (uint64_t)a[9] * b[3];
+#else
+    const __m256i a4456 = _mm256_permute4x64_epi64(a4567, _MM_SHUFFLE(2, 1, 0, 0));
+    const __m256i a3210 = reverse_m256i_epi64(a0123);
+    const __m256i a3456 = _mm256_blend_epi32(a4456, a3210, 0b0000'0011);
+    const __m256i b543z = _mm256_and_si256(b5432, yyyn);
+    const __m256i a7899 = _mm256_permute4x64_epi64(a6789, _MM_SHUFFLE(3, 3, 2, 1));
+    ymm0 = _mm256_mul_epu32(a3456, b9876);
+    ymm1 = _mm256_mul_epu32(a7899, b543z);
+    ymm2 = _mm256_add_epi64(ymm0, ymm1);
+    d += hsum_uint64_avx(ymm2);
+#endif
     VERIFY_BITS(d, 63);
     /* [d 0 0 t9 0 0 0 0 0 0 c t1 t0] = [p12 p11 p10 p9 0 0 0 0 0 0 p2 p1 p0] */
     u2 = d & M; d >>= 26; c += u2 * R0;
@@ -622,18 +709,34 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     /* [d u2 0 0 t9 0 0 0 0 0 c-u2*R1 t2-u2*R0 t1 t0] = [p12 p11 p10 p9 0 0 0 0 0 0 p2 p1 p0] */
     /* [d 0 0 0 t9 0 0 0 0 0 c t2 t1 t0] = [p12 p11 p10 p9 0 0 0 0 0 0 p2 p1 p0] */
 
+#ifndef INTC_HASWELL
     c += (uint64_t)a[0] * b[3]
        + (uint64_t)a[1] * b[2]
        + (uint64_t)a[2] * b[1]
        + (uint64_t)a[3] * b[0];
+#else
+    const __m256i b3210 = _mm256_permute2x128_si256(b5432, b10zz, 0b0010'0001);
+    ymm0 = _mm256_mul_epu32(a0123, b3210);
+    c += hsum_uint64_avx(ymm0);
+#endif
+
     VERIFY_BITS(c, 63);
     /* [d 0 0 0 t9 0 0 0 0 0 c t2 t1 t0] = [p12 p11 p10 p9 0 0 0 0 0 p3 p2 p1 p0] */
+#ifndef INTC_HASWELL
     d += (uint64_t)a[4] * b[9]
        + (uint64_t)a[5] * b[8]
        + (uint64_t)a[6] * b[7]
        + (uint64_t)a[7] * b[6]
        + (uint64_t)a[8] * b[5]
        + (uint64_t)a[9] * b[4];
+#else
+    ymm0 = _mm256_mul_epu32(a4567, b9876);
+    ymm1 = _mm256_mul_epu32(a89zz, b5432);
+    ymm2 = _mm256_add_epi64(ymm0, ymm1);
+    d += hsum_uint64_avx(ymm2);
+#endif
+
+
     VERIFY_BITS(d, 63);
     /* [d 0 0 0 t9 0 0 0 0 0 c t2 t1 t0] = [p13 p12 p11 p10 p9 0 0 0 0 0 p3 p2 p1 p0] */
     u3 = d & M; d >>= 26; c += u3 * R0;
@@ -647,18 +750,28 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     /* [d u3 0 0 0 t9 0 0 0 0 c-u3*R1 t3-u3*R0 t2 t1 t0] = [p13 p12 p11 p10 p9 0 0 0 0 0 p3 p2 p1 p0] */
     /* [d 0 0 0 0 t9 0 0 0 0 c t3 t2 t1 t0] = [p13 p12 p11 p10 p9 0 0 0 0 0 p3 p2 p1 p0] */
 
+#ifndef INTC_HASWELL
     c += (uint64_t)a[0] * b[4]
        + (uint64_t)a[1] * b[3]
        + (uint64_t)a[2] * b[2]
        + (uint64_t)a[3] * b[1]
        + (uint64_t)a[4] * b[0];
+#else
+    c += hsum_uint64_avx(_mm256_mul_epu32(a1234, b3210)) + (uint64_t)a[0] * b[4];
+#endif
     VERIFY_BITS(c, 63);
+
     /* [d 0 0 0 0 t9 0 0 0 0 c t3 t2 t1 t0] = [p13 p12 p11 p10 p9 0 0 0 0 p4 p3 p2 p1 p0] */
+#ifndef INTC_HASWELL
     d += (uint64_t)a[5] * b[9]
        + (uint64_t)a[6] * b[8]
        + (uint64_t)a[7] * b[7]
        + (uint64_t)a[8] * b[6]
        + (uint64_t)a[9] * b[5];
+#else
+    d += hsum_uint64_avx(_mm256_mul_epu32(a5678, b9876)) + (uint64_t)a[9] * b[5];
+#endif
+
     VERIFY_BITS(d, 62);
     /* [d 0 0 0 0 t9 0 0 0 0 c t3 t2 t1 t0] = [p14 p13 p12 p11 p10 p9 0 0 0 0 p4 p3 p2 p1 p0] */
     u4 = d & M; d >>= 26; c += u4 * R0;
@@ -672,18 +785,33 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     /* [d u4 0 0 0 0 t9 0 0 0 c-u4*R1 t4-u4*R0 t3 t2 t1 t0] = [p14 p13 p12 p11 p10 p9 0 0 0 0 p4 p3 p2 p1 p0] */
     /* [d 0 0 0 0 0 t9 0 0 0 c t4 t3 t2 t1 t0] = [p14 p13 p12 p11 p10 p9 0 0 0 0 p4 p3 p2 p1 p0] */
 
+#ifndef INTC_HASWELL
     c += (uint64_t)a[0] * b[5]
        + (uint64_t)a[1] * b[4]
        + (uint64_t)a[2] * b[3]
        + (uint64_t)a[3] * b[2]
        + (uint64_t)a[4] * b[1]
        + (uint64_t)a[5] * b[0];
+#else
+    ymm0 = _mm256_mul_epu32(a0123, b5432);
+    ymm1 = _mm256_mul_epu32(a4567, b10zz);
+    ymm2 = _mm256_add_epi64(ymm0, ymm1);
+    c += hsum_uint64_avx(ymm2);
+#endif
+
+
     VERIFY_BITS(c, 63);
     /* [d 0 0 0 0 0 t9 0 0 0 c t4 t3 t2 t1 t0] = [p14 p13 p12 p11 p10 p9 0 0 0 p5 p4 p3 p2 p1 p0] */
+#ifndef INTC_HASWELL
     d += (uint64_t)a[6] * b[9]
        + (uint64_t)a[7] * b[8]
        + (uint64_t)a[8] * b[7]
        + (uint64_t)a[9] * b[6];
+#else
+    d += hsum_uint64_avx(_mm256_mul_epu32(a6789, b9876));
+#endif
+
+
     VERIFY_BITS(d, 62);
     /* [d 0 0 0 0 0 t9 0 0 0 c t4 t3 t2 t1 t0] = [p15 p14 p13 p12 p11 p10 p9 0 0 0 p5 p4 p3 p2 p1 p0] */
     u5 = d & M; d >>= 26; c += u5 * R0;
@@ -697,6 +825,7 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     /* [d u5 0 0 0 0 0 t9 0 0 c-u5*R1 t5-u5*R0 t4 t3 t2 t1 t0] = [p15 p14 p13 p12 p11 p10 p9 0 0 0 p5 p4 p3 p2 p1 p0] */
     /* [d 0 0 0 0 0 0 t9 0 0 c t5 t4 t3 t2 t1 t0] = [p15 p14 p13 p12 p11 p10 p9 0 0 0 p5 p4 p3 p2 p1 p0] */
 
+#ifndef INTC_HASWELL
     c += (uint64_t)a[0] * b[6]
        + (uint64_t)a[1] * b[5]
        + (uint64_t)a[2] * b[4]
@@ -704,11 +833,23 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
        + (uint64_t)a[4] * b[2]
        + (uint64_t)a[5] * b[1]
        + (uint64_t)a[6] * b[0];
+#else
+    ymm0 = _mm256_mul_epu32(a1234, b5432);
+    ymm1 = _mm256_mul_epu32(a5678, b10zz);
+    ymm2 = _mm256_add_epi64(ymm0, ymm1);
+    c += hsum_uint64_avx(ymm2) + (uint64_t)a[0] * b[6];
+#endif
     VERIFY_BITS(c, 63);
     /* [d 0 0 0 0 0 0 t9 0 0 c t5 t4 t3 t2 t1 t0] = [p15 p14 p13 p12 p11 p10 p9 0 0 p6 p5 p4 p3 p2 p1 p0] */
+#ifndef INTC_HASWELL
     d += (uint64_t)a[7] * b[9]
        + (uint64_t)a[8] * b[8]
        + (uint64_t)a[9] * b[7];
+#else
+const __m256i a789z = _mm256_and_si256(a7899, yyyn);
+    d += hsum_uint64_avx(_mm256_mul_epu32(a789z, b9876));
+#endif
+
     VERIFY_BITS(d, 61);
     /* [d 0 0 0 0 0 0 t9 0 0 c t5 t4 t3 t2 t1 t0] = [p16 p15 p14 p13 p12 p11 p10 p9 0 0 p6 p5 p4 p3 p2 p1 p0] */
     u6 = d & M; d >>= 26; c += u6 * R0;
@@ -722,6 +863,7 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     /* [d u6 0 0 0 0 0 0 t9 0 c-u6*R1 t6-u6*R0 t5 t4 t3 t2 t1 t0] = [p16 p15 p14 p13 p12 p11 p10 p9 0 0 p6 p5 p4 p3 p2 p1 p0] */
     /* [d 0 0 0 0 0 0 0 t9 0 c t6 t5 t4 t3 t2 t1 t0] = [p16 p15 p14 p13 p12 p11 p10 p9 0 0 p6 p5 p4 p3 p2 p1 p0] */
 
+#ifndef INTC_HASWELL
     c += (uint64_t)a[0] * b[7]
        + (uint64_t)a[1] * b[6]
        + (uint64_t)a[2] * b[5]
@@ -730,11 +872,23 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
        + (uint64_t)a[5] * b[2]
        + (uint64_t)a[6] * b[1]
        + (uint64_t)a[7] * b[0];
+#else
+    const __m256i b7654 = _mm256_permute2x128_si256(b9876, b5432, 0b0010'0001);
+    ymm0 = _mm256_mul_epu32(a0123, b7654);
+    ymm1 = _mm256_mul_epu32(a4567, b3210);
+    ymm2 = _mm256_add_epi64(ymm0, ymm1);
+    c += hsum_uint64_avx(ymm2);
+#endif
     /* VERIFY_BITS(c, 64); */
     VERIFY_CHECK(c <= 0x8000007C00000007ULL);
     /* [d 0 0 0 0 0 0 0 t9 0 c t6 t5 t4 t3 t2 t1 t0] = [p16 p15 p14 p13 p12 p11 p10 p9 0 p7 p6 p5 p4 p3 p2 p1 p0] */
+#ifndef INTC_HASWELL
     d += (uint64_t)a[8] * b[9]
        + (uint64_t)a[9] * b[8];
+#else
+    d += hsum_uint64_avx(_mm256_mul_epu32(a89zz, b9876));
+#endif
+
     VERIFY_BITS(d, 58);
     /* [d 0 0 0 0 0 0 0 t9 0 c t6 t5 t4 t3 t2 t1 t0] = [p17 p16 p15 p14 p13 p12 p11 p10 p9 0 p7 p6 p5 p4 p3 p2 p1 p0] */
     u7 = d & M; d >>= 26; c += u7 * R0;
@@ -749,6 +903,7 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
     /* [d u7 0 0 0 0 0 0 0 t9 c-u7*R1 t7-u7*R0 t6 t5 t4 t3 t2 t1 t0] = [p17 p16 p15 p14 p13 p12 p11 p10 p9 0 p7 p6 p5 p4 p3 p2 p1 p0] */
     /* [d 0 0 0 0 0 0 0 0 t9 c t7 t6 t5 t4 t3 t2 t1 t0] = [p17 p16 p15 p14 p13 p12 p11 p10 p9 0 p7 p6 p5 p4 p3 p2 p1 p0] */
 
+#ifndef INTC_HASWELL
     c += (uint64_t)a[0] * b[8]
        + (uint64_t)a[1] * b[7]
        + (uint64_t)a[2] * b[6]
@@ -758,6 +913,13 @@ SECP256K1_INLINE static void secp256k1_fe_mul_inner(uint32_t *r, const uint32_t 
        + (uint64_t)a[6] * b[2]
        + (uint64_t)a[7] * b[1]
        + (uint64_t)a[8] * b[0];
+#else
+    ymm0 = _mm256_mul_epu32(a1234, b7654);
+    ymm1 = _mm256_mul_epu32(a5678, b3210);
+    ymm2 = _mm256_add_epi64(ymm0, ymm1);
+    c += hsum_uint64_avx(ymm2) + (uint64_t)a[0] * b[8];
+#endif
+
     /* VERIFY_BITS(c, 64); */
     VERIFY_CHECK(c <= 0x9000007B80000008ULL);
     /* [d 0 0 0 0 0 0 0 0 t9 c t7 t6 t5 t4 t3 t2 t1 t0] = [p17 p16 p15 p14 p13 p12 p11 p10 p9 p8 p7 p6 p5 p4 p3 p2 p1 p0] */
